@@ -60,8 +60,30 @@ public class AutoComplete {
     public static final int EXIT_CODE_COMPLETION_SCRIPT_EXISTS = 3;
     /** Exit code of this application when an exception was encountered during operation ({@value}). */
     public static final int EXIT_CODE_EXECUTION_ERROR = 4;
+    /** Supported shell completion scripts */
+    enum Shell {
+        bash,
+        zsh;
+
+        public ShellData getData() {
+            if (this == Shell.zsh) {
+                return new Zsh();
+            }
+            return new Bash();
+        }
+    }
 
     private AutoComplete() { }
+
+    interface ShellData {
+        default String getScriptHeader() {
+            return "";
+        }
+
+        default String getScriptFooter() {
+            return "";
+        }
+    }
 
     /**
      * Generates a bash completion script for the specified command class.
@@ -160,6 +182,9 @@ public class AutoComplete {
         @Option(names = {"-f", "--force"}, description = "Overwrite existing script files.")
         boolean overwriteIfExists;
 
+        @Option(names = {"--shell"}, description = "Shell type: ${COMPLETION-CANDIDATES} (default: bash)")
+        Shell shell = Shell.bash;
+
         @Spec CommandSpec spec;
 
         public Integer call() throws Exception {
@@ -191,7 +216,7 @@ public class AutoComplete {
                 return EXIT_CODE_COMPLETION_SCRIPT_EXISTS;
             }
 
-            AutoComplete.bash(commandName, autoCompleteScript, commandScript, commandLine);
+            AutoComplete.script(shell, commandName, autoCompleteScript, commandScript, commandLine);
             return EXIT_CODE_SUCCESS;
         }
 
@@ -231,8 +256,11 @@ public class AutoComplete {
 
         @Spec CommandLine.Model.CommandSpec spec;
 
+        @CommandLine.Option(names = "--shell", description = "Shell type: ${COMPLETION-CANDIDATES} (default: bash)")
+        Shell shell = Shell.bash;
+
         public void run() {
-            String script = AutoComplete.bash(
+            String script = AutoComplete.script(shell,
                     spec.root().name(),
                     spec.root().commandLine());
             // not PrintWriter.println: scripts with Windows line separators fail in strange ways!
@@ -285,6 +313,193 @@ public class AutoComplete {
             return f.type() == Boolean.TYPE || f.type() == Boolean.class;
         }
     }
+
+    /**
+     * Helper class to build zsh _arguments specifications for command options.
+     */
+    static class ArgumentsBuilder {
+        private final CommandSpec commandSpec;
+
+        ArgumentsBuilder(CommandSpec commandSpec) {
+            this.commandSpec = commandSpec;
+        }
+
+        /**
+         * Builds just the option specifications (without positional parameters or subcommand specs).
+         * Used for commands with subcommands where we need to insert options before subcommand handling.
+         * @return the option specifications string
+         */
+        String buildOptionsOnly() {
+            List<String> specs = new ArrayList<String>();
+
+            // Add option specs
+            for (OptionSpec option : commandSpec.options()) {
+                specs.add(buildOptionSpec(option));
+            }
+
+            if (specs.isEmpty()) {
+                return "";
+            }
+            return concat(" \\\n    ", specs.toArray(new String[0])) + " \\\n    ";
+        }
+
+        /**
+         * Builds the complete _arguments specification for all options and positional parameters.
+         * @return the _arguments specification string
+         */
+        String build() {
+            List<String> specs = new ArrayList<String>();
+
+            // Add option specs
+            for (OptionSpec option : commandSpec.options()) {
+                specs.add(buildOptionSpec(option));
+            }
+
+            // If there are subcommands, use state-based completion
+            // Otherwise, add positional parameter specs
+            if (!commandSpec.subcommands().isEmpty()) {
+                specs.add("'1: :->command'");
+                specs.add("'*:: :->args'");
+            } else {
+                for (PositionalParamSpec positional : commandSpec.positionalParameters()) {
+                    specs.add(buildPositionalSpec(positional));
+                }
+            }
+
+            return concat(" \\\n    ", specs.toArray(new String[0]));
+        }
+
+        /**
+         * Generates a zsh option specification for an option.
+         * Format for flags: '-v[description]' or '(-v --verbose)'{-v,--verbose}'[description]'
+         * Format for options with args: '-o[description]:message:' or '(-f --file)'{-f,--file}'[description]:message:'
+         * @param option the option to generate a spec for
+         * @return the option specification string
+         */
+        String buildOptionSpec(OptionSpec option) {
+            String[] names = option.names();
+            String description = formatDescription(getDescriptionText(option));
+
+            // Build option spec
+            String prefix;
+
+            if (names.length == 1) {
+                // Single name: just the option name
+                prefix = "'" + names[0];
+            } else {
+                // Multiple names (aliases): use alias exclusivity and grouping
+                // Format: '(-j --json)'{-j,--json}'[description]'
+                String aliasExclusivity = "(" + concat(" ", names) + ")";
+                prefix = "'" + aliasExclusivity + "'{" + concat(",", names) + "}'";
+            }
+
+            if (isFlagOption(option)) {
+                return prefix + "[" + description + "]'";
+            } else {
+                String message = getMessage(option);
+                String action = getCompletionAction(option);
+                String colonPrefix = option.arity().min == 0 ? "::" : ":";
+                return prefix + "[" + description + "]" + colonPrefix + message + ":" + action + "'";
+            }
+        }
+
+        /**
+         * Determines if an option is a flag (takes no arguments).
+         * @param option the option to check
+         * @return true if the option is a flag
+         */
+        boolean isFlagOption(OptionSpec option) {
+            return option.arity().max == 0;
+        }
+
+        /**
+         * Gets the message for an option or positional parameter.
+         * @param argSpec the option or positional parameter
+         * @return the message string (e.g., "file", "value")
+         */
+        private String getMessage(ArgSpec argSpec) {
+            String paramLabel = argSpec.paramLabel();
+            if (paramLabel != null && paramLabel.length() > 0) {
+                return paramLabel.replaceAll("[<>]", "").toLowerCase();
+            }
+            return argSpec.type().getSimpleName().toLowerCase();
+        }
+
+        /**
+         * Gets the description text for an option.
+         * @param option the option
+         * @return the description text, or empty string if none
+         */
+        private String getDescriptionText(OptionSpec option) {
+            String[] descriptions = option.description();
+            if (descriptions == null || descriptions.length == 0) {
+                return "";
+            }
+            return descriptions[0];
+        }
+
+        /**
+         * Formats a description for use in zsh completion scripts.
+         * Truncates to 80 chars and escapes single quotes.
+         * @param description the description to format
+         * @return the formatted description
+         */
+        private String formatDescription(String description) {
+            if (description == null || description.length() == 0) {
+                return "";
+            }
+            String text = description.length() > 80 ? description.substring(0, 77) + "..." : description;
+            // In single quotes, only single quote needs escaping: ' becomes '\''
+            return text.replace("'", "'\\''");
+        }
+
+        /**
+         * Generates a zsh positional parameter specification.
+         * Format: 'N:message:action' for specific position or '*:message:action' for variable arity
+         * @param positional the positional parameter to generate a spec for
+         * @return the positional specification string
+         */
+        String buildPositionalSpec(PositionalParamSpec positional) {
+            String message = getMessage(positional);
+            String action = getCompletionAction(positional);
+
+            // Check if this is variable arity (multiple values)
+            if (positional.arity().max > 1 || positional.arity().max == -1) {
+                return "'*:" + message + ":" + action + "'";
+            } else {
+                int position = positional.index().min + 1;
+                return "'" + position + ":" + message + ":" + action + "'";
+            }
+        }
+
+        /**
+         * Gets the completion action for an option or positional parameter.
+         * @param argSpec the option or positional parameter
+         * @return the zsh completion action (e.g., "_files", "(value1 value2)", etc.)
+         */
+        private String getCompletionAction(ArgSpec argSpec) {
+            Class<?> type = argSpec.type();
+            if (type == java.io.File.class || type == java.nio.file.Path.class) {
+                return "_files";
+            }
+
+            // Handle enums and completion candidates uniformly
+            List<String> values = new ArrayList<String>();
+            if (type.isEnum()) {
+                Object[] enumConstants = type.getEnumConstants();
+                for (int i = 0; i < enumConstants.length; i++) {
+                    values.add(enumConstants[i].toString());
+                }
+            } else if (argSpec.completionCandidates() != null) {
+                for (String candidate : argSpec.completionCandidates()) {
+                    values.add(candidate);
+                }
+            }
+
+            return values.isEmpty() ? "" : "(" + concat(" ", values.toArray(new String[0])) + ")";
+        }
+    }
+
     private static <T> Predicate<T> negate(final Predicate<T> original) {
         return new Predicate<T>() {
             public boolean test(T t) {
@@ -313,7 +528,122 @@ public class AutoComplete {
         }
     }
 
-    private static final String SCRIPT_HEADER = "" +
+    private static String sanitizeScriptName(String scriptName) {
+        return scriptName
+                .replaceAll("\\.sh", "")
+                .replaceAll("\\.bash", "")
+                .replaceAll("\\.\\/", "");
+    }
+
+    /**
+     * Generates source code for an autocompletion bash script for the specified picocli-based application,
+     * and writes this script to the specified {@code out} file, and optionally writes an invocation script
+     * to the specified {@code command} file.
+     *
+     * @param scriptName  the name of the command to generate a bash autocompletion script for
+     * @param out         the file to write the autocompletion bash script source code to
+     * @param command     the file to write a helper script to that invokes the command, or {@code null} if no helper script file should be written
+     * @param commandLine the {@code CommandLine} instance for the command line application
+     * @throws IOException if a problem occurred writing to the specified files
+     */
+    public static void bash(String scriptName, File out, File command, CommandLine commandLine) throws IOException {
+        script(Shell.bash, scriptName, out, command, commandLine);
+    }
+
+    /**
+     * Generates source code for an autocompletion zsh script for the specified picocli-based application,
+     * and writes this script to the specified {@code out} file, and optionally writes an invocation script
+     * to the specified {@code command} file.
+     *
+     * @param scriptName  the name of the command to generate a bash autocompletion script for
+     * @param out         the file to write the autocompletion bash script source code to
+     * @param command     the file to write a helper script to that invokes the command, or {@code null} if no helper script file should be written
+     * @param commandLine the {@code CommandLine} instance for the command line application
+     * @throws IOException if a problem occurred writing to the specified files
+     */
+    public static void zsh(String scriptName, File out, File command, CommandLine commandLine) throws IOException {
+        script(Shell.zsh, scriptName, out, command, commandLine);
+    }
+
+    private static void script(Shell shell, String scriptName, File out, File command, CommandLine commandLine) throws IOException {
+        String autoCompleteScript = script(shell, scriptName, commandLine);
+        Writer completionWriter = null;
+        Writer scriptWriter = null;
+        try {
+            completionWriter = new FileWriter(out);
+            completionWriter.write(autoCompleteScript);
+
+            if (command != null) {
+                scriptWriter = new FileWriter(command);
+                scriptWriter.write("" +
+                        "#!/usr/bin/env bash\n" +
+                        "\n" +
+                        "LIBS=path/to/libs\n" +
+                        "CP=\"${LIBS}/myApp.jar\"\n" +
+                        "java -cp \"${CP}\" '" + ((Object) commandLine.getCommand()).getClass().getName() + "' $@");
+            }
+        } finally {
+            if (completionWriter != null) { completionWriter.close(); }
+            if (scriptWriter != null)     { scriptWriter.close(); }
+        }
+    }
+
+    /**
+     * Generates and returns the source code for an autocompletion bash script for the specified picocli-based application.
+     *
+     * @param scriptName the name of the command to generate a bash autocompletion script for
+     * @param commandLine the {@code CommandLine} instance for the command line application
+     * @return source code for an autocompletion bash script
+     */
+    public static String bash(String scriptName, CommandLine commandLine) {
+        return script(Shell.bash, scriptName, commandLine);
+    }
+
+    /**
+     * Generates and returns the source code for an autocompletion zsh script for the specified picocli-based application.
+     *
+     * @param scriptName the name of the command to generate a bash autocompletion script for
+     * @param commandLine the {@code CommandLine} instance for the command line application
+     * @return source code for an autocompletion zsh script
+     */
+    public static String zsh(String scriptName, CommandLine commandLine) {
+        return script(Shell.bash, scriptName, commandLine);
+    }
+
+    private static String script(Shell shell, String scriptName, CommandLine commandLine) {
+        if (scriptName == null)  { throw new NullPointerException("scriptName"); }
+        if (commandLine == null) { throw new NullPointerException("commandLine"); }
+        scriptName = sanitizeScriptName(scriptName);
+        StringBuilder result = new StringBuilder();
+        ShellData shellData = shell.getData();
+        result.append(format(shellData.getScriptHeader(), scriptName, CommandLine.VERSION));
+
+        List<CommandDescriptor> hierarchy = createHierarchy(scriptName, commandLine);
+
+        if (shell == Shell.zsh) {
+            for (CommandDescriptor descriptor : hierarchy) {
+                if (descriptor.commandLine.getCommandSpec().usageMessage().hidden()) { continue; }
+                CommandSpec spec = descriptor.commandLine.getCommandSpec();
+                if (spec.subcommands().isEmpty()) {
+                    result.append(generateZshLeafFunction(scriptName, descriptor));
+                } else {
+                    result.append(generateZshFunctionForCommand(scriptName, descriptor));
+                }
+            }
+        } else {
+            result.append(generateBashEntryPointFunction(scriptName, commandLine, hierarchy));
+            for (CommandDescriptor descriptor : hierarchy) {
+                if (descriptor.commandLine.getCommandSpec().usageMessage().hidden()) { continue; }
+                result.append(generateBashFunctionForCommand(descriptor.functionName, descriptor.commandName, descriptor.commandLine));
+            }
+        }
+
+        result.append(format(shellData.getScriptFooter(), scriptName));
+        return result.toString();
+    }
+
+    public static class Bash implements ShellData {
+        private static final String SCRIPT_HEADER = "" +
             "#!/usr/bin/env bash\n" +
             "#\n" +
             "# %1$s Bash Completion\n" +
@@ -465,7 +795,7 @@ public class AutoComplete {
             "}\n" +
             "\n";
 
-    private static final String SCRIPT_FOOTER = "" +
+        private static final String SCRIPT_FOOTER = "" +
             "\n" +
             "# Define a completion specification (a compspec) for the\n" +
             "# `%1$s`, `%1$s.sh`, and `%1$s.bash` commands.\n" +
@@ -476,68 +806,140 @@ public class AutoComplete {
             "# default Bash completions and the Readline default filename completions are performed.\n" +
             "complete -F _complete_%1$s -o default %1$s %1$s.sh %1$s.bash\n";
 
-    private static String sanitizeScriptName(String scriptName) {
-        return scriptName
-                .replaceAll("\\.sh", "")
-                .replaceAll("\\.bash", "")
-                .replaceAll("\\.\\/", "");
+        @Override
+        public String getScriptHeader() {
+            return SCRIPT_HEADER;
+        }
+
+        @Override
+        public String getScriptFooter() {
+            return SCRIPT_FOOTER;
+        }
+    }
+
+    public static class Zsh implements ShellData {
+        private final static String SCRIPT_HEADER = "" +
+            "\n" +
+            "#compdef %1$s\n" +
+            "# Generated by picocli AutoComplete\n" +
+            "# Version: %2$s\n";
+
+        private final static String SCRIPT_FOOTER = "" +
+            "\n" +
+            "compdef _%1$s %1$s\n";
+
+        @Override
+        public String getScriptHeader() {
+            return SCRIPT_HEADER;
+        }
+
+        @Override
+        public String getScriptFooter() {
+            return SCRIPT_FOOTER;
+        }
     }
 
     /**
-     * Generates source code for an autocompletion bash script for the specified picocli-based application,
-     * and writes this script to the specified {@code out} file, and optionally writes an invocation script
-     * to the specified {@code command} file.
-     * @param scriptName the name of the command to generate a bash autocompletion script for
-     * @param commandLine the {@code CommandLine} instance for the command line application
-     * @param out the file to write the autocompletion bash script source code to
-     * @param command the file to write a helper script to that invokes the command, or {@code null} if no helper script file should be written
-     * @throws IOException if a problem occurred writing to the specified files
+     * Generates a zsh completion function for a command with subcommands (routing node).
      */
-    public static void bash(String scriptName, File out, File command, CommandLine commandLine) throws IOException {
-        String autoCompleteScript = bash(scriptName, commandLine);
-        Writer completionWriter = null;
-        Writer scriptWriter = null;
-        try {
-            completionWriter = new FileWriter(out);
-            completionWriter.write(autoCompleteScript);
+    private static String generateZshFunctionForCommand(String scriptName, CommandDescriptor descriptor) {
+        CommandSpec spec = descriptor.commandLine.getCommandSpec();
+        String functionName = descriptor.functionName.replace("_picocli_", "_");
+        String commandName = descriptor.commandName;
 
-            if (command != null) {
-                scriptWriter = new FileWriter(command);
-                scriptWriter.write("" +
-                        "#!/usr/bin/env bash\n" +
-                        "\n" +
-                        "LIBS=path/to/libs\n" +
-                        "CP=\"${LIBS}/myApp.jar\"\n" +
-                        "java -cp \"${CP}\" '" + ((Object) commandLine.getCommand()).getClass().getName() + "' $@");
+        // Build option specs for this command
+        ArgumentsBuilder argsBuilder = new ArgumentsBuilder(spec);
+        String optionSpecs = argsBuilder.buildOptionsOnly();
+
+        // Build subcommand list
+        StringBuilder subcommands = new StringBuilder();
+        for (Map.Entry<String, CommandLine> entry : spec.subcommands().entrySet()) {
+            CommandSpec subSpec = entry.getValue().getCommandSpec();
+            if (subSpec.usageMessage().hidden()) { continue; }
+
+            String name = entry.getKey();
+            String[] descriptions = subSpec.usageMessage().description();
+            String description = "";
+            if (descriptions != null && descriptions.length > 0) {
+                String text = descriptions[0];
+                if (text.length() > 80) {
+                    text = text.substring(0, 77) + "...";
+                }
+                description = text.replace("'", "'\\''");
             }
-        } finally {
-            if (completionWriter != null) { completionWriter.close(); }
-            if (scriptWriter != null)     { scriptWriter.close(); }
+
+            subcommands.append("        \"").append(name).append("[").append(description).append("]\" \\\n");
         }
+        if (subcommands.length() > 0) {
+            subcommands.setLength(subcommands.length() - 3); // Remove last " \\\n"
+            subcommands.append("\n");
+        }
+
+        // Build routing cases
+        StringBuilder routing = new StringBuilder();
+        for (Map.Entry<String, CommandLine> entry : spec.subcommands().entrySet()) {
+            CommandSpec subSpec = entry.getValue().getCommandSpec();
+            if (subSpec.usageMessage().hidden()) { continue; }
+
+            String name = entry.getKey();
+            String subFunctionName = functionName + "_" + bashify(name);
+
+            routing.append("        ").append(name).append(")\n");
+            routing.append("          ").append(subFunctionName).append("\n");
+            routing.append("          ;;\n");
+        }
+
+        String FUNCTION_WITH_SUBCOMMANDS = "" +
+                "%s() {\n" +
+                "  local line state\n" +
+                "\n" +
+                "  _arguments -C \\\n" +
+                "    %s" +
+                "\"1: :->cmds\" \\\n" +
+                "    \"*::arg:->args\"\n" +
+                "\n" +
+                "  case \"$state\" in\n" +
+                "    cmds)\n" +
+                "      _values \"%s command\" \\\n" +
+                "%s" +
+                "      ;;\n" +
+                "    args)\n" +
+                "      case $line[1] in\n" +
+                "%s" +
+                "      esac\n" +
+                "      ;;\n" +
+                "  esac\n" +
+                "}\n" +
+                "\n";
+
+        return format(FUNCTION_WITH_SUBCOMMANDS, functionName, optionSpecs, commandName, subcommands, routing);
     }
 
     /**
-     * Generates and returns the source code for an autocompletion bash script for the specified picocli-based application.
-     * @param scriptName the name of the command to generate a bash autocompletion script for
-     * @param commandLine the {@code CommandLine} instance for the command line application
-     * @return source code for an autocompletion bash script
+     * Generates a zsh completion function for a leaf command (no subcommands).
      */
-    public static String bash(String scriptName, CommandLine commandLine) {
-        if (scriptName == null)  { throw new NullPointerException("scriptName"); }
-        if (commandLine == null) { throw new NullPointerException("commandLine"); }
-        scriptName = sanitizeScriptName(scriptName);
-        StringBuilder result = new StringBuilder();
-        result.append(format(SCRIPT_HEADER, scriptName, CommandLine.VERSION));
+    private static String generateZshLeafFunction(String scriptName, CommandDescriptor descriptor) {
+        CommandSpec spec = descriptor.commandLine.getCommandSpec();
+        String functionName = descriptor.functionName.replace("_picocli_", "_");
 
-        List<CommandDescriptor> hierarchy = createHierarchy(scriptName, commandLine);
-        result.append(generateEntryPointFunction(scriptName, commandLine, hierarchy));
+        ArgumentsBuilder argsBuilder = new ArgumentsBuilder(spec);
+        String optionSpecs = argsBuilder.build();
 
-        for (CommandDescriptor descriptor : hierarchy) {
-            if (descriptor.commandLine.getCommandSpec().usageMessage().hidden()) { continue; } // #887 skip hidden subcommands
-            result.append(generateFunctionForCommand(descriptor.functionName, descriptor.commandName, descriptor.commandLine));
+        if (optionSpecs.length() > 0) {
+            String FUNCTION_WITH_ARGS = "" +
+                    "%s() {\n" +
+                    "  _arguments -s \\\n" +
+                    "    %s\n" +
+                    "}\n" +
+                    "\n";
+            return format(FUNCTION_WITH_ARGS, functionName, optionSpecs);
+        } else {
+            String FUNCTION_NO_ARGS = "" +
+                    "%s() {\n" +
+                    "}\n" +
+                    "\n";
+            return format(FUNCTION_NO_ARGS, functionName);
         }
-        result.append(format(SCRIPT_FOOTER, scriptName));
-        return result.toString();
     }
 
     private static List<CommandDescriptor> createHierarchy(String scriptName, CommandLine commandLine) {
@@ -572,9 +974,9 @@ public class AutoComplete {
         }
     }
 
-    private static String generateEntryPointFunction(String scriptName,
-                                                     CommandLine commandLine,
-                                                     List<CommandDescriptor> hierarchy) {
+    private static String generateBashEntryPointFunction(String scriptName,
+                                                         CommandLine commandLine,
+                                                         List<CommandDescriptor> hierarchy) {
         String FUNCTION_HEADER = "" +
                 "# Bash completion entry point function.\n" +
                 "# _complete_%1$s finds which commands and subcommands have been specified\n" +
@@ -666,7 +1068,7 @@ public class AutoComplete {
         return sb.append(normalize.apply(lastValue)).toString();
     }
 
-    private static String generateFunctionForCommand(String functionName, String commandName, CommandLine commandLine) {
+    private static String generateBashFunctionForCommand(String functionName, String commandName, CommandLine commandLine) {
         String FUNCTION_HEADER = "" +
                 "\n" +
                 "# Generates completions for the options and subcommands of the `%s` %scommand.\n" +
