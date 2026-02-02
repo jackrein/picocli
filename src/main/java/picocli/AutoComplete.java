@@ -60,30 +60,8 @@ public class AutoComplete {
     public static final int EXIT_CODE_COMPLETION_SCRIPT_EXISTS = 3;
     /** Exit code of this application when an exception was encountered during operation ({@value}). */
     public static final int EXIT_CODE_EXECUTION_ERROR = 4;
-    /** Supported shell completion scripts */
-    enum Shell {
-        bash,
-        zsh;
-
-        public ShellData getData() {
-            if (this == Shell.zsh) {
-                return new Zsh();
-            }
-            return new Bash();
-        }
-    }
 
     private AutoComplete() { }
-
-    interface ShellData {
-        default String getScriptHeader() {
-            return "";
-        }
-
-        default String getScriptFooter() {
-            return "";
-        }
-    }
 
     /**
      * Generates a bash completion script for the specified command class.
@@ -155,6 +133,23 @@ public class AutoComplete {
             exitCodeOnExecutionException = EXIT_CODE_EXECUTION_ERROR)
     private static class App implements Callable<Integer> {
 
+        enum Shell {
+            bash {
+                @Override
+                void write(String scriptName, File out, File command, CommandLine commandLine) throws IOException {
+                    AutoComplete.bash(scriptName, out, command, commandLine);
+                }
+            },
+            zsh {
+                @Override
+                void write(String scriptName, File out, File command, CommandLine commandLine) throws IOException {
+                    AutoComplete.zsh(scriptName, out, command, commandLine);
+                }
+            };
+
+            abstract void write(String scriptName, File out, File command, CommandLine commandLine) throws IOException;
+        }
+
         @Parameters(arity = "1", description = "Fully qualified class name of the annotated " +
                 "`@Command` class to generate a completion script for.")
         String commandLineFQCN;
@@ -182,8 +177,8 @@ public class AutoComplete {
         @Option(names = {"-f", "--force"}, description = "Overwrite existing script files.")
         boolean overwriteIfExists;
 
-        @Option(names = {"--shell"}, description = "Shell type: ${COMPLETION-CANDIDATES} (default: bash)")
-        Shell shell = Shell.bash;
+        @Option(names = {"-s", "--shell"}, description = "Shell type: ${COMPLETION-CANDIDATES} (default: bash)", defaultValue = "bash")
+        Shell shell;
 
         @Spec CommandSpec spec;
 
@@ -216,7 +211,7 @@ public class AutoComplete {
                 return EXIT_CODE_COMPLETION_SCRIPT_EXISTS;
             }
 
-            AutoComplete.script(shell, commandName, autoCompleteScript, commandScript, commandLine);
+            shell.write(commandName, autoCompleteScript, commandScript, commandLine);
             return EXIT_CODE_SUCCESS;
         }
 
@@ -379,7 +374,26 @@ public class AutoComplete {
      * @throws IOException if a problem occurred writing to the specified files
      */
     public static void bash(String scriptName, File out, File command, CommandLine commandLine) throws IOException {
-        script(Shell.bash, scriptName, out, command, commandLine);
+        String autoCompleteScript = bash(scriptName, commandLine);
+        Writer completionWriter = null;
+        Writer scriptWriter = null;
+        try {
+            completionWriter = new FileWriter(out);
+            completionWriter.write(autoCompleteScript);
+
+            if (command != null) {
+                scriptWriter = new FileWriter(command);
+                scriptWriter.write("" +
+                    "#!/usr/bin/env bash\n" +
+                    "\n" +
+                    "LIBS=path/to/libs\n" +
+                    "CP=\"${LIBS}/myApp.jar\"\n" +
+                    "java -cp \"${CP}\" '" + ((Object) commandLine.getCommand()).getClass().getName() + "' $@");
+            }
+        } finally {
+            if (completionWriter != null) { completionWriter.close(); }
+            if (scriptWriter != null)     { scriptWriter.close(); }
+        }
     }
 
     /**
@@ -394,11 +408,7 @@ public class AutoComplete {
      * @throws IOException if a problem occurred writing to the specified files
      */
     public static void zsh(String scriptName, File out, File command, CommandLine commandLine) throws IOException {
-        script(Shell.zsh, scriptName, out, command, commandLine);
-    }
-
-    private static void script(Shell shell, String scriptName, File out, File command, CommandLine commandLine) throws IOException {
-        String autoCompleteScript = script(shell, scriptName, commandLine);
+        String autoCompleteScript = zsh(scriptName, commandLine);
         Writer completionWriter = null;
         Writer scriptWriter = null;
         try {
@@ -408,11 +418,11 @@ public class AutoComplete {
             if (command != null) {
                 scriptWriter = new FileWriter(command);
                 scriptWriter.write("" +
-                        "#!/usr/bin/env bash\n" +
-                        "\n" +
-                        "LIBS=path/to/libs\n" +
-                        "CP=\"${LIBS}/myApp.jar\"\n" +
-                        "java -cp \"${CP}\" '" + ((Object) commandLine.getCommand()).getClass().getName() + "' $@");
+                    "#!/usr/bin/env bash\n" +
+                    "\n" +
+                    "LIBS=path/to/libs\n" +
+                    "CP=\"${LIBS}/myApp.jar\"\n" +
+                    "java -cp \"${CP}\" '" + ((Object) commandLine.getCommand()).getClass().getName() + "' $@");
             }
         } finally {
             if (completionWriter != null) { completionWriter.close(); }
@@ -428,7 +438,22 @@ public class AutoComplete {
      * @return source code for an autocompletion bash script
      */
     public static String bash(String scriptName, CommandLine commandLine) {
-        return script(Shell.bash, scriptName, commandLine);
+        if (scriptName == null)  { throw new NullPointerException("scriptName"); }
+        if (commandLine == null) { throw new NullPointerException("commandLine"); }
+        scriptName = sanitizeScriptName(scriptName);
+        StringBuilder result = new StringBuilder();
+        result.append(format(SCRIPT_HEADER, scriptName, CommandLine.VERSION));
+
+        List<CommandDescriptor> hierarchy = createHierarchy(scriptName, commandLine);
+
+        result.append(generateBashEntryPointFunction(scriptName, commandLine, hierarchy));
+        for (CommandDescriptor descriptor : hierarchy) {
+            if (descriptor.commandLine.getCommandSpec().usageMessage().hidden()) { continue; }
+            result.append(generateBashFunctionForCommand(descriptor.functionName, descriptor.commandName, descriptor.commandLine));
+        }
+
+        result.append(format(SCRIPT_FOOTER, scriptName));
+        return result.toString();
     }
 
     /**
@@ -439,232 +464,187 @@ public class AutoComplete {
      * @return source code for an autocompletion zsh script
      */
     public static String zsh(String scriptName, CommandLine commandLine) {
-        return script(Shell.zsh, scriptName, commandLine);
-    }
-
-    private static String script(Shell shell, String scriptName, CommandLine commandLine) {
         if (scriptName == null)  { throw new NullPointerException("scriptName"); }
         if (commandLine == null) { throw new NullPointerException("commandLine"); }
         scriptName = sanitizeScriptName(scriptName);
         StringBuilder result = new StringBuilder();
-        ShellData shellData = shell.getData();
-        result.append(format(shellData.getScriptHeader(), scriptName, CommandLine.VERSION));
+        result.append(
+            format("#compdef %1$s\n# Generated by picocli AutoComplete\n# Version: %2$s\n\n",
+                scriptName, CommandLine.VERSION));
 
         List<CommandDescriptor> hierarchy = createHierarchy(scriptName, commandLine);
 
-        if (shell == Shell.zsh) {
-            for (CommandDescriptor descriptor : hierarchy) {
-                if (descriptor.commandLine.getCommandSpec().usageMessage().hidden()) { continue; }
-                result.append(generateZshFunctionForCommand(descriptor.functionName, descriptor.commandName, descriptor.commandLine));
-            }
-        } else {
-            result.append(generateBashEntryPointFunction(scriptName, commandLine, hierarchy));
-            for (CommandDescriptor descriptor : hierarchy) {
-                if (descriptor.commandLine.getCommandSpec().usageMessage().hidden()) { continue; }
-                result.append(generateBashFunctionForCommand(descriptor.functionName, descriptor.commandName, descriptor.commandLine));
-            }
+        for (CommandDescriptor descriptor : hierarchy) {
+            if (descriptor.commandLine.getCommandSpec().usageMessage().hidden()) { continue; }
+            result.append(generateZshFunctionForCommand(descriptor.functionName, descriptor.commandName, descriptor.commandLine));
         }
 
-        result.append(format(shellData.getScriptFooter(), scriptName));
+        result.append(format("compdef _picocli_%1$s %1$s\n", scriptName));
         return result.toString();
     }
 
-    public static class Bash implements ShellData {
-        private static final String SCRIPT_HEADER = "" +
-            "#!/usr/bin/env bash\n" +
-            "#\n" +
-            "# %1$s Bash Completion\n" +
-            "# =======================\n" +
-            "#\n" +
-            "# Bash completion support for the `%1$s` command,\n" +
-            "# generated by [picocli](https://picocli.info/) version %2$s.\n" +
-            "#\n" +
-            "# Installation\n" +
-            "# ------------\n" +
-            "#\n" +
-            "# 1. Source all completion scripts in your .bash_profile\n" +
-            "#\n" +
-            "#   cd $YOUR_APP_HOME/bin\n" +
-            "#   for f in $(find . -name \"*_completion\"); do line=\". $(pwd)/$f\"; grep \"$line\" ~/.bash_profile || echo \"$line\" >> ~/.bash_profile; done\n" +
-            "#\n" +
-            "# 2. Open a new bash console, and type `%1$s [TAB][TAB]`\n" +
-            "#\n" +
-            "# 1a. Alternatively, if you have [bash-completion](https://github.com/scop/bash-completion) installed:\n" +
-            "#     Place this file in a `bash-completion.d` folder:\n" +
-            "#\n" +
-            "#   * /etc/bash-completion.d\n" +
-            "#   * /usr/local/etc/bash-completion.d\n" +
-            "#   * ~/bash-completion.d\n" +
-            "#\n" +
-            "# Documentation\n" +
-            "# -------------\n" +
-            "# The script is called by bash whenever [TAB] or [TAB][TAB] is pressed after\n" +
-            "# '%1$s (..)'. By reading entered command line parameters,\n" +
-            "# it determines possible bash completions and writes them to the COMPREPLY variable.\n" +
-            "# Bash then completes the user input if only one entry is listed in the variable or\n" +
-            "# shows the options if more than one is listed in COMPREPLY.\n" +
-            "#\n" +
-            "# References\n" +
-            "# ----------\n" +
-            "# [1] http://stackoverflow.com/a/12495480/1440785\n" +
-            "# [2] http://tiswww.case.edu/php/chet/bash/FAQ\n" +
-            "# [3] https://www.gnu.org/software/bash/manual/html_node/The-Shopt-Builtin.html\n" +
-            "# [4] http://zsh.sourceforge.net/Doc/Release/Options.html#index-COMPLETE_005fALIASES\n" +
-            "# [5] https://stackoverflow.com/questions/17042057/bash-check-element-in-array-for-elements-in-another-array/17042655#17042655\n" +
-            "# [6] https://www.gnu.org/software/bash/manual/html_node/Programmable-Completion.html#Programmable-Completion\n" +
-            "# [7] https://stackoverflow.com/questions/3249432/can-a-bash-tab-completion-script-be-used-in-zsh/27853970#27853970\n" +
-            "#\n" +
-            "\n" +
-            "if [ -n \"$BASH_VERSION\" ]; then\n" +
-            "  # Enable programmable completion facilities when using bash (see [3])\n" +
-            "  shopt -s progcomp\n" +
-            "elif [ -n \"$ZSH_VERSION\" ]; then\n" +
-            "  # Make alias a distinct command for completion purposes when using zsh (see [4])\n" +
-            "  setopt COMPLETE_ALIASES\n" +
-            "  alias compopt=complete\n" +
-            "\n" +
-            "  # Enable bash completion in zsh (see [7])\n" +
-            "  # Only initialize completions module once to avoid unregistering existing completions.\n" +
-            "  if ! type compdef > /dev/null; then\n" +
-            "    autoload -U +X compinit && compinit\n" +
-            "  fi\n" +
-            "  autoload -U +X bashcompinit && bashcompinit\n" +
-            "fi\n" +
-            "\n" +
-            "# CompWordsContainsArray takes an array and then checks\n" +
-            "# if all elements of this array are in the global COMP_WORDS array.\n" +
-            "#\n" +
-            "# Returns zero (no error) if all elements of the array are in the COMP_WORDS array,\n" +
-            "# otherwise returns 1 (error).\n" +
-            "function CompWordsContainsArray() {\n" +
-            "  declare -a localArray\n" +
-            "  localArray=(\"$@\")\n" +
-            "  local findme\n" +
-            "  for findme in \"${localArray[@]}\"; do\n" +
-            "    if ElementNotInCompWords \"$findme\"; then return 1; fi\n" +
-            "  done\n" +
-            "  return 0\n" +
-            "}\n" +
-            "function ElementNotInCompWords() {\n" +
-            "  local findme=\"$1\"\n" +
-            "  local element\n" +
-            "  for element in \"${COMP_WORDS[@]}\"; do\n" +
-            "    if [[ \"$findme\" = \"$element\" ]]; then return 1; fi\n" +
-            "  done\n" +
-            "  return 0\n" +
-            "}\n" +
-            "\n" +
-            "# The `currentPositionalIndex` function calculates the index of the current positional parameter.\n" +
-            "#\n" +
-            "# currentPositionalIndex takes three parameters:\n" +
-            "# the command name,\n" +
-            "# a space-separated string with the names of options that take a parameter, and\n" +
-            "# a space-separated string with the names of boolean options (that don't take any params).\n" +
-            "# When done, this function echos the current positional index to std_out.\n" +
-            "#\n" +
-            "# Example usage:\n" +
-            "# local currIndex=$(currentPositionalIndex \"mysubcommand\" \"$ARG_OPTS\" \"$FLAG_OPTS\")\n" +
-            "function currentPositionalIndex() {\n" +
-            "  local commandName=\"$1\"\n" +
-            "  local optionsWithArgs=\"$2\"\n" +
-            "  local booleanOptions=\"$3\"\n" +
-            "  local previousWord\n" +
-            "  local result=0\n" +
-            "\n" +
-            "  for i in $(seq $((COMP_CWORD - 1)) -1 0); do\n" +
-            "    previousWord=${COMP_WORDS[i]}\n" +
-            "    if [ \"${previousWord}\" = \"$commandName\" ]; then\n" +
-            "      break\n" +
-            "    fi\n" +
-            "    if [[ \"${optionsWithArgs}\" =~ ${previousWord} ]]; then\n" +
-            "      ((result-=2)) # Arg option and its value not counted as positional param\n" +
-            "    elif [[ \"${booleanOptions}\" =~ ${previousWord} ]]; then\n" +
-            "      ((result-=1)) # Flag option itself not counted as positional param\n" +
-            "    fi\n" +
-            "    ((result++))\n" +
-            "  done\n" +
-            "  echo \"$result\"\n" +
-            "}\n" +
-            "\n" +
-            "# compReplyArray generates a list of completion suggestions based on an array, ensuring all values are properly escaped.\n" +
-            "#\n" +
-            "# compReplyArray takes a single parameter: the array of options to be displayed\n" +
-            "#\n" +
-            "# The output is echoed to std_out, one option per line.\n"
-            + "#\n"
-            + "# Example usage:\n"
-            + "# local options=(\"foo\", \"bar\", \"baz\")\n"
-            + "# local IFS=$'\\n'\n"
-            + "# COMPREPLY=($(compReplyArray \"${options[@]}\"))\n" +
-            "function compReplyArray() {\n" +
-            "  declare -a options\n" +
-            "  options=(\"$@\")\n" +
-            "  local curr_word=${COMP_WORDS[COMP_CWORD]}\n" +
-            "  local i\n" +
-            "  local quoted\n" +
-            "  local optionList=()\n" +
-            "\n" +
-            "  for (( i=0; i<${#options[@]}; i++ )); do\n" +
-            "    # Double escape, since we want escaped values, but compgen -W expands the argument\n" +
-            "    printf -v quoted %%q \"${options[i]}\"\n" +
-            "    quoted=\\'${quoted//\\'/\\'\\\\\\'\\'}\\'\n" +
-            "\n" +
-            "    optionList[i]=$quoted\n" +
-            "  done\n" +
-            "\n" +
-            "  # We also have to add another round of escaping to $curr_word.\n" +
-            "  curr_word=${curr_word//\\\\/\\\\\\\\}\n" +
-            "  curr_word=${curr_word//\\'/\\\\\\'}\n" +
-            "\n" +
-            "  # Actually generate completions.\n" +
-            "  local IFS=$'\\n'\n" +
-            "  echo -e \"$(compgen -W \"${optionList[*]}\" -- \"$curr_word\")\"\n" +
-            "}\n" +
-            "\n";
+    private static final String SCRIPT_HEADER = "" +
+        "#!/usr/bin/env bash\n" +
+        "#\n" +
+        "# %1$s Bash Completion\n" +
+        "# =======================\n" +
+        "#\n" +
+        "# Bash completion support for the `%1$s` command,\n" +
+        "# generated by [picocli](https://picocli.info/) version %2$s.\n" +
+        "#\n" +
+        "# Installation\n" +
+        "# ------------\n" +
+        "#\n" +
+        "# 1. Source all completion scripts in your .bash_profile\n" +
+        "#\n" +
+        "#   cd $YOUR_APP_HOME/bin\n" +
+        "#   for f in $(find . -name \"*_completion\"); do line=\". $(pwd)/$f\"; grep \"$line\" ~/.bash_profile || echo \"$line\" >> ~/.bash_profile; done\n" +
+        "#\n" +
+        "# 2. Open a new bash console, and type `%1$s [TAB][TAB]`\n" +
+        "#\n" +
+        "# 1a. Alternatively, if you have [bash-completion](https://github.com/scop/bash-completion) installed:\n" +
+        "#     Place this file in a `bash-completion.d` folder:\n" +
+        "#\n" +
+        "#   * /etc/bash-completion.d\n" +
+        "#   * /usr/local/etc/bash-completion.d\n" +
+        "#   * ~/bash-completion.d\n" +
+        "#\n" +
+        "# Documentation\n" +
+        "# -------------\n" +
+        "# The script is called by bash whenever [TAB] or [TAB][TAB] is pressed after\n" +
+        "# '%1$s (..)'. By reading entered command line parameters,\n" +
+        "# it determines possible bash completions and writes them to the COMPREPLY variable.\n" +
+        "# Bash then completes the user input if only one entry is listed in the variable or\n" +
+        "# shows the options if more than one is listed in COMPREPLY.\n" +
+        "#\n" +
+        "# References\n" +
+        "# ----------\n" +
+        "# [1] http://stackoverflow.com/a/12495480/1440785\n" +
+        "# [2] http://tiswww.case.edu/php/chet/bash/FAQ\n" +
+        "# [3] https://www.gnu.org/software/bash/manual/html_node/The-Shopt-Builtin.html\n" +
+        "# [4] http://zsh.sourceforge.net/Doc/Release/Options.html#index-COMPLETE_005fALIASES\n" +
+        "# [5] https://stackoverflow.com/questions/17042057/bash-check-element-in-array-for-elements-in-another-array/17042655#17042655\n" +
+        "# [6] https://www.gnu.org/software/bash/manual/html_node/Programmable-Completion.html#Programmable-Completion\n" +
+        "# [7] https://stackoverflow.com/questions/3249432/can-a-bash-tab-completion-script-be-used-in-zsh/27853970#27853970\n" +
+        "#\n" +
+        "\n" +
+        "if [ -n \"$BASH_VERSION\" ]; then\n" +
+        "  # Enable programmable completion facilities when using bash (see [3])\n" +
+        "  shopt -s progcomp\n" +
+        "elif [ -n \"$ZSH_VERSION\" ]; then\n" +
+        "  # Make alias a distinct command for completion purposes when using zsh (see [4])\n" +
+        "  setopt COMPLETE_ALIASES\n" +
+        "  alias compopt=complete\n" +
+        "\n" +
+        "  # Enable bash completion in zsh (see [7])\n" +
+        "  # Only initialize completions module once to avoid unregistering existing completions.\n" +
+        "  if ! type compdef > /dev/null; then\n" +
+        "    autoload -U +X compinit && compinit\n" +
+        "  fi\n" +
+        "  autoload -U +X bashcompinit && bashcompinit\n" +
+        "fi\n" +
+        "\n" +
+        "# CompWordsContainsArray takes an array and then checks\n" +
+        "# if all elements of this array are in the global COMP_WORDS array.\n" +
+        "#\n" +
+        "# Returns zero (no error) if all elements of the array are in the COMP_WORDS array,\n" +
+        "# otherwise returns 1 (error).\n" +
+        "function CompWordsContainsArray() {\n" +
+        "  declare -a localArray\n" +
+        "  localArray=(\"$@\")\n" +
+        "  local findme\n" +
+        "  for findme in \"${localArray[@]}\"; do\n" +
+        "    if ElementNotInCompWords \"$findme\"; then return 1; fi\n" +
+        "  done\n" +
+        "  return 0\n" +
+        "}\n" +
+        "function ElementNotInCompWords() {\n" +
+        "  local findme=\"$1\"\n" +
+        "  local element\n" +
+        "  for element in \"${COMP_WORDS[@]}\"; do\n" +
+        "    if [[ \"$findme\" = \"$element\" ]]; then return 1; fi\n" +
+        "  done\n" +
+        "  return 0\n" +
+        "}\n" +
+        "\n" +
+        "# The `currentPositionalIndex` function calculates the index of the current positional parameter.\n" +
+        "#\n" +
+        "# currentPositionalIndex takes three parameters:\n" +
+        "# the command name,\n" +
+        "# a space-separated string with the names of options that take a parameter, and\n" +
+        "# a space-separated string with the names of boolean options (that don't take any params).\n" +
+        "# When done, this function echos the current positional index to std_out.\n" +
+        "#\n" +
+        "# Example usage:\n" +
+        "# local currIndex=$(currentPositionalIndex \"mysubcommand\" \"$ARG_OPTS\" \"$FLAG_OPTS\")\n" +
+        "function currentPositionalIndex() {\n" +
+        "  local commandName=\"$1\"\n" +
+        "  local optionsWithArgs=\"$2\"\n" +
+        "  local booleanOptions=\"$3\"\n" +
+        "  local previousWord\n" +
+        "  local result=0\n" +
+        "\n" +
+        "  for i in $(seq $((COMP_CWORD - 1)) -1 0); do\n" +
+        "    previousWord=${COMP_WORDS[i]}\n" +
+        "    if [ \"${previousWord}\" = \"$commandName\" ]; then\n" +
+        "      break\n" +
+        "    fi\n" +
+        "    if [[ \"${optionsWithArgs}\" =~ ${previousWord} ]]; then\n" +
+        "      ((result-=2)) # Arg option and its value not counted as positional param\n" +
+        "    elif [[ \"${booleanOptions}\" =~ ${previousWord} ]]; then\n" +
+        "      ((result-=1)) # Flag option itself not counted as positional param\n" +
+        "    fi\n" +
+        "    ((result++))\n" +
+        "  done\n" +
+        "  echo \"$result\"\n" +
+        "}\n" +
+        "\n" +
+        "# compReplyArray generates a list of completion suggestions based on an array, ensuring all values are properly escaped.\n" +
+        "#\n" +
+        "# compReplyArray takes a single parameter: the array of options to be displayed\n" +
+        "#\n" +
+        "# The output is echoed to std_out, one option per line.\n"
+        + "#\n"
+        + "# Example usage:\n"
+        + "# local options=(\"foo\", \"bar\", \"baz\")\n"
+        + "# local IFS=$'\\n'\n"
+        + "# COMPREPLY=($(compReplyArray \"${options[@]}\"))\n" +
+        "function compReplyArray() {\n" +
+        "  declare -a options\n" +
+        "  options=(\"$@\")\n" +
+        "  local curr_word=${COMP_WORDS[COMP_CWORD]}\n" +
+        "  local i\n" +
+        "  local quoted\n" +
+        "  local optionList=()\n" +
+        "\n" +
+        "  for (( i=0; i<${#options[@]}; i++ )); do\n" +
+        "    # Double escape, since we want escaped values, but compgen -W expands the argument\n" +
+        "    printf -v quoted %%q \"${options[i]}\"\n" +
+        "    quoted=\\'${quoted//\\'/\\'\\\\\\'\\'}\\'\n" +
+        "\n" +
+        "    optionList[i]=$quoted\n" +
+        "  done\n" +
+        "\n" +
+        "  # We also have to add another round of escaping to $curr_word.\n" +
+        "  curr_word=${curr_word//\\\\/\\\\\\\\}\n" +
+        "  curr_word=${curr_word//\\'/\\\\\\'}\n" +
+        "\n" +
+        "  # Actually generate completions.\n" +
+        "  local IFS=$'\\n'\n" +
+        "  echo -e \"$(compgen -W \"${optionList[*]}\" -- \"$curr_word\")\"\n" +
+        "}\n" +
+        "\n";
 
-        private static final String SCRIPT_FOOTER = "" +
-            "\n" +
-            "# Define a completion specification (a compspec) for the\n" +
-            "# `%1$s`, `%1$s.sh`, and `%1$s.bash` commands.\n" +
-            "# Uses the bash `complete` builtin (see [6]) to specify that shell function\n" +
-            "# `_complete_%1$s` is responsible for generating possible completions for the\n" +
-            "# current word on the command line.\n" +
-            "# The `-o default` option means that if the function generated no matches, the\n" +
-            "# default Bash completions and the Readline default filename completions are performed.\n" +
-            "complete -F _complete_%1$s -o default %1$s %1$s.sh %1$s.bash\n";
-
-        @Override
-        public String getScriptHeader() {
-            return SCRIPT_HEADER;
-        }
-
-        @Override
-        public String getScriptFooter() {
-            return SCRIPT_FOOTER;
-        }
-    }
-
-    public static class Zsh implements ShellData {
-        private final static String SCRIPT_HEADER = "" +
-            "\n" +
-            "#compdef %1$s\n" +
-            "# Generated by picocli AutoComplete\n" +
-            "# Version: %2$s\n\n";
-
-        private final static String SCRIPT_FOOTER = "" +
-            "\n" +
-            "compdef _picocli_%1$s %1$s\n\n";
-
-        @Override
-        public String getScriptHeader() {
-            return SCRIPT_HEADER;
-        }
-
-        @Override
-        public String getScriptFooter() {
-            return SCRIPT_FOOTER;
-        }
-    }
+    private static final String SCRIPT_FOOTER = "" +
+        "\n" +
+        "# Define a completion specification (a compspec) for the\n" +
+        "# `%1$s`, `%1$s.sh`, and `%1$s.bash` commands.\n" +
+        "# Uses the bash `complete` builtin (see [6]) to specify that shell function\n" +
+        "# `_complete_%1$s` is responsible for generating possible completions for the\n" +
+        "# current word on the command line.\n" +
+        "# The `-o default` option means that if the function generated no matches, the\n" +
+        "# default Bash completions and the Readline default filename completions are performed.\n" +
+        "complete -F _complete_%1$s -o default %1$s %1$s.sh %1$s.bash\n";
 
     /**
      * Generate a zsh autocompletion script for a given command

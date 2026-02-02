@@ -605,7 +605,7 @@ public class AutoCompleteTest {
     public void testGenerateCompletionUsageMessage() {
         CommandLine cmd = new CommandLine(new MyApp());
         String expected = String.format("" +
-                "Usage: myapp generate-completion [-hV] [--shell=<shell>]%n" +
+                "Usage: myapp generate-completion [-hV] [-s=<shell>]%n" +
                 "Generate bash/zsh completion script for myapp.%n" +
                 "Run the following command to give `myapp` TAB completion in the current shell:%n" +
                 "%n" +
@@ -613,7 +613,7 @@ public class AutoCompleteTest {
                 "%n" +
                 "Options:%n" +
                 "  -h, --help            Show this help message and exit.%n" +
-                "      --shell=<shell>   Shell type: bash, zsh (default: bash)%n" +
+                "  -s, --shell=<shell>   Shell type: bash, zsh (default: bash)%n" +
                 "  -V, --version         Print version information and exit.%n");
         CommandLine gen = cmd.getSubcommands().get("generate-completion");
         assertEquals(expected, gen.getUsageMessage(CommandLine.Help.Ansi.OFF));
@@ -832,13 +832,13 @@ public class AutoCompleteTest {
                     "\n" +
                     "  local commands=\"\"\n" +
                     "  local flag_opts=\"'-h' '--help' '-V' '--version'\"\n" +
-                    "  local arg_opts=\"'--shell'\"\n" +
+                    "  local arg_opts=\"'-s' '--shell'\"\n" +
                     "  local shell_option_args=(\"bash\" \"zsh\") # --shell values\n" +
                     "\n" +
                     "  type compopt &>/dev/null && compopt +o default\n" +
                     "\n" +
                     "  case ${prev_word} in\n" +
-                    "    '--shell')\n" +
+                    "    '-s'|'--shell')\n" +
                     "      local IFS=$'\\n'\n" +
                     "      COMPREPLY=( $( compReplyArray \"${shell_option_args[@]}\" ) )\n" +
                     "      return $?\n" +
@@ -1152,7 +1152,7 @@ public class AutoCompleteTest {
                 .getSubcommands().get("generate-completion");
         gen.getCommandSpec().usageMessage().hidden(true);
         String expectedGen = String.format("" +
-                "Usage: Demo Level1 Level2 generate-completion [-hV] [--shell=<shell>]%n" +
+                "Usage: Demo Level1 Level2 generate-completion [-hV] [-s=<shell>]%n" +
                 "Generate bash/zsh completion script for Demo.%n" +
                 "Run the following command to give `Demo` TAB completion in the current shell:%n" +
                 "%n" +
@@ -1160,7 +1160,7 @@ public class AutoCompleteTest {
                 "%n" +
                 "Options:%n" +
                 "  -h, --help            Show this help message and exit.%n" +
-                "      --shell=<shell>   Shell type: bash, zsh (default: bash)%n" +
+                "  -s, --shell=<shell>   Shell type: bash, zsh (default: bash)%n" +
                 "  -V, --version         Print version information and exit.%n");
         assertEquals(expectedGen, gen.getUsageMessage(CommandLine.Help.Ansi.OFF));
     }
