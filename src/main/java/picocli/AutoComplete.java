@@ -254,15 +254,34 @@ public class AutoComplete {
     )
     public static class GenerateCompletion implements Runnable {
 
+        enum Shell {
+            bash {
+                @Override
+                String generate(CommandSpec spec) {
+                    return AutoComplete.bash(
+                        spec.root().name(),
+                        spec.root().commandLine());
+                }
+            },
+            zsh {
+                @Override
+                String generate(CommandSpec spec) {
+                    return AutoComplete.zsh(
+                        spec.root().name(),
+                        spec.root().commandLine());
+                }
+            };
+
+            abstract String generate(CommandSpec spec);
+        }
+
         @Spec CommandLine.Model.CommandSpec spec;
 
-        @CommandLine.Option(names = "--shell", description = "Shell type: ${COMPLETION-CANDIDATES} (default: bash)")
-        Shell shell = Shell.bash;
+        @CommandLine.Option(names = {"-s", "--shell"}, description = "Shell type: ${COMPLETION-CANDIDATES} (default: bash)", defaultValue = "bash")
+        Shell shell;
 
         public void run() {
-            String script = AutoComplete.script(shell,
-                    spec.root().name(),
-                    spec.root().commandLine());
+            String script = shell.generate(spec);
             // not PrintWriter.println: scripts with Windows line separators fail in strange ways!
             spec.commandLine().getOut().print(script);
             spec.commandLine().getOut().print('\n');
@@ -313,193 +332,6 @@ public class AutoComplete {
             return f.type() == Boolean.TYPE || f.type() == Boolean.class;
         }
     }
-
-    /**
-     * Helper class to build zsh _arguments specifications for command options.
-     */
-    static class ArgumentsBuilder {
-        private final CommandSpec commandSpec;
-
-        ArgumentsBuilder(CommandSpec commandSpec) {
-            this.commandSpec = commandSpec;
-        }
-
-        /**
-         * Builds just the option specifications (without positional parameters or subcommand specs).
-         * Used for commands with subcommands where we need to insert options before subcommand handling.
-         * @return the option specifications string
-         */
-        String buildOptionsOnly() {
-            List<String> specs = new ArrayList<String>();
-
-            // Add option specs
-            for (OptionSpec option : commandSpec.options()) {
-                specs.add(buildOptionSpec(option));
-            }
-
-            if (specs.isEmpty()) {
-                return "";
-            }
-            return concat(" \\\n    ", specs.toArray(new String[0])) + " \\\n    ";
-        }
-
-        /**
-         * Builds the complete _arguments specification for all options and positional parameters.
-         * @return the _arguments specification string
-         */
-        String build() {
-            List<String> specs = new ArrayList<String>();
-
-            // Add option specs
-            for (OptionSpec option : commandSpec.options()) {
-                specs.add(buildOptionSpec(option));
-            }
-
-            // If there are subcommands, use state-based completion
-            // Otherwise, add positional parameter specs
-            if (!commandSpec.subcommands().isEmpty()) {
-                specs.add("'1: :->command'");
-                specs.add("'*:: :->args'");
-            } else {
-                for (PositionalParamSpec positional : commandSpec.positionalParameters()) {
-                    specs.add(buildPositionalSpec(positional));
-                }
-            }
-
-            return concat(" \\\n    ", specs.toArray(new String[0]));
-        }
-
-        /**
-         * Generates a zsh option specification for an option.
-         * Format for flags: '-v[description]' or '(-v --verbose)'{-v,--verbose}'[description]'
-         * Format for options with args: '-o[description]:message:' or '(-f --file)'{-f,--file}'[description]:message:'
-         * @param option the option to generate a spec for
-         * @return the option specification string
-         */
-        String buildOptionSpec(OptionSpec option) {
-            String[] names = option.names();
-            String description = formatDescription(getDescriptionText(option));
-
-            // Build option spec
-            String prefix;
-
-            if (names.length == 1) {
-                // Single name: just the option name
-                prefix = "'" + names[0];
-            } else {
-                // Multiple names (aliases): use alias exclusivity and grouping
-                // Format: '(-j --json)'{-j,--json}'[description]'
-                String aliasExclusivity = "(" + concat(" ", names) + ")";
-                prefix = "'" + aliasExclusivity + "'{" + concat(",", names) + "}'";
-            }
-
-            if (isFlagOption(option)) {
-                return prefix + "[" + description + "]'";
-            } else {
-                String message = getMessage(option);
-                String action = getCompletionAction(option);
-                String colonPrefix = option.arity().min == 0 ? "::" : ":";
-                return prefix + "[" + description + "]" + colonPrefix + message + ":" + action + "'";
-            }
-        }
-
-        /**
-         * Determines if an option is a flag (takes no arguments).
-         * @param option the option to check
-         * @return true if the option is a flag
-         */
-        boolean isFlagOption(OptionSpec option) {
-            return option.arity().max == 0;
-        }
-
-        /**
-         * Gets the message for an option or positional parameter.
-         * @param argSpec the option or positional parameter
-         * @return the message string (e.g., "file", "value")
-         */
-        private String getMessage(ArgSpec argSpec) {
-            String paramLabel = argSpec.paramLabel();
-            if (paramLabel != null && paramLabel.length() > 0) {
-                return paramLabel.replaceAll("[<>]", "").toLowerCase();
-            }
-            return argSpec.type().getSimpleName().toLowerCase();
-        }
-
-        /**
-         * Gets the description text for an option.
-         * @param option the option
-         * @return the description text, or empty string if none
-         */
-        private String getDescriptionText(OptionSpec option) {
-            String[] descriptions = option.description();
-            if (descriptions == null || descriptions.length == 0) {
-                return "";
-            }
-            return descriptions[0];
-        }
-
-        /**
-         * Formats a description for use in zsh completion scripts.
-         * Truncates to 80 chars and escapes single quotes.
-         * @param description the description to format
-         * @return the formatted description
-         */
-        private String formatDescription(String description) {
-            if (description == null || description.length() == 0) {
-                return "";
-            }
-            String text = description.length() > 80 ? description.substring(0, 77) + "..." : description;
-            // In single quotes, only single quote needs escaping: ' becomes '\''
-            return text.replace("'", "'\\''");
-        }
-
-        /**
-         * Generates a zsh positional parameter specification.
-         * Format: 'N:message:action' for specific position or '*:message:action' for variable arity
-         * @param positional the positional parameter to generate a spec for
-         * @return the positional specification string
-         */
-        String buildPositionalSpec(PositionalParamSpec positional) {
-            String message = getMessage(positional);
-            String action = getCompletionAction(positional);
-
-            // Check if this is variable arity (multiple values)
-            if (positional.arity().max > 1 || positional.arity().max == -1) {
-                return "'*:" + message + ":" + action + "'";
-            } else {
-                int position = positional.index().min + 1;
-                return "'" + position + ":" + message + ":" + action + "'";
-            }
-        }
-
-        /**
-         * Gets the completion action for an option or positional parameter.
-         * @param argSpec the option or positional parameter
-         * @return the zsh completion action (e.g., "_files", "(value1 value2)", etc.)
-         */
-        private String getCompletionAction(ArgSpec argSpec) {
-            Class<?> type = argSpec.type();
-            if (type == java.io.File.class || type == java.nio.file.Path.class) {
-                return "_files";
-            }
-
-            // Handle enums and completion candidates uniformly
-            List<String> values = new ArrayList<String>();
-            if (type.isEnum()) {
-                Object[] enumConstants = type.getEnumConstants();
-                for (int i = 0; i < enumConstants.length; i++) {
-                    values.add(enumConstants[i].toString());
-                }
-            } else if (argSpec.completionCandidates() != null) {
-                for (String candidate : argSpec.completionCandidates()) {
-                    values.add(candidate);
-                }
-            }
-
-            return values.isEmpty() ? "" : "(" + concat(" ", values.toArray(new String[0])) + ")";
-        }
-    }
-
     private static <T> Predicate<T> negate(final Predicate<T> original) {
         return new Predicate<T>() {
             public boolean test(T t) {
@@ -607,7 +439,7 @@ public class AutoComplete {
      * @return source code for an autocompletion zsh script
      */
     public static String zsh(String scriptName, CommandLine commandLine) {
-        return script(Shell.bash, scriptName, commandLine);
+        return script(Shell.zsh, scriptName, commandLine);
     }
 
     private static String script(Shell shell, String scriptName, CommandLine commandLine) {
@@ -623,12 +455,7 @@ public class AutoComplete {
         if (shell == Shell.zsh) {
             for (CommandDescriptor descriptor : hierarchy) {
                 if (descriptor.commandLine.getCommandSpec().usageMessage().hidden()) { continue; }
-                CommandSpec spec = descriptor.commandLine.getCommandSpec();
-                if (spec.subcommands().isEmpty()) {
-                    result.append(generateZshLeafFunction(scriptName, descriptor));
-                } else {
-                    result.append(generateZshFunctionForCommand(scriptName, descriptor));
-                }
+                result.append(generateZshFunctionForCommand(descriptor.functionName, descriptor.commandName, descriptor.commandLine));
             }
         } else {
             result.append(generateBashEntryPointFunction(scriptName, commandLine, hierarchy));
@@ -822,11 +649,11 @@ public class AutoComplete {
             "\n" +
             "#compdef %1$s\n" +
             "# Generated by picocli AutoComplete\n" +
-            "# Version: %2$s\n";
+            "# Version: %2$s\n\n";
 
         private final static String SCRIPT_FOOTER = "" +
             "\n" +
-            "compdef _%1$s %1$s\n";
+            "compdef _picocli_%1$s %1$s\n\n";
 
         @Override
         public String getScriptHeader() {
@@ -840,107 +667,160 @@ public class AutoComplete {
     }
 
     /**
-     * Generates a zsh completion function for a command with subcommands (routing node).
+     * Generate a zsh autocompletion script for a given command
+     * <p>
+     * There are three cases here:
+     * 1. When there are no options, parameters, or subcommands, an empty function is generated
+     * 2. When there are no subcommands, a single call to _arguments is generated in the function
+     * 3. When there are subcommands, there's a call to _arguments, as well as a case match / routing to the
+     *    subcommand completion function
      */
-    private static String generateZshFunctionForCommand(String scriptName, CommandDescriptor descriptor) {
-        CommandSpec spec = descriptor.commandLine.getCommandSpec();
-        String functionName = descriptor.functionName.replace("_picocli_", "_");
-        String commandName = descriptor.commandName;
-
-        // Build option specs for this command
-        ArgumentsBuilder argsBuilder = new ArgumentsBuilder(spec);
-        String optionSpecs = argsBuilder.buildOptionsOnly();
-
-        // Build subcommand list
-        StringBuilder subcommands = new StringBuilder();
-        for (Map.Entry<String, CommandLine> entry : spec.subcommands().entrySet()) {
-            CommandSpec subSpec = entry.getValue().getCommandSpec();
-            if (subSpec.usageMessage().hidden()) { continue; }
-
-            String name = entry.getKey();
-            String[] descriptions = subSpec.usageMessage().description();
-            String description = "";
-            if (descriptions != null && descriptions.length > 0) {
-                String text = descriptions[0];
-                if (text.length() > 80) {
-                    text = text.substring(0, 77) + "...";
-                }
-                description = text.replace("'", "'\\''");
-            }
-
-            subcommands.append("        \"").append(name).append("[").append(description).append("]\" \\\n");
+    private static String generateZshFunctionForCommand(String functionName, String commandName, CommandLine commandLine) {
+        CommandSpec spec = commandLine.getCommandSpec();
+        List<CommandSpec> subcommands = new ArrayList<>();
+        for (CommandLine cmd : spec.subcommands().values()) {
+            subcommands.add(cmd.getCommandSpec());
         }
-        if (subcommands.length() > 0) {
-            subcommands.setLength(subcommands.length() - 3); // Remove last " \\\n"
-            subcommands.append("\n");
+        if (spec.options().isEmpty() && spec.positionalParameters().isEmpty() && subcommands.isEmpty()) {
+            // nothing to autocomplete, empty function
+            return format("%s() {\n}\n\n", functionName);
         }
 
-        // Build routing cases
-        StringBuilder routing = new StringBuilder();
-        for (Map.Entry<String, CommandLine> entry : spec.subcommands().entrySet()) {
-            CommandSpec subSpec = entry.getValue().getCommandSpec();
-            if (subSpec.usageMessage().hidden()) { continue; }
+        List<String> optionFragments = buildZshOptionFragments(spec.options());
+        List<String> parameterFragments = buildZshParameterFragments(spec.positionalParameters());
+        List<String> subcommandSelectionFragments = buildZshSubcommandSelectionFragments(subcommands);
+        List<String> subcommandRoutingFragments = buildZshSubcommandRoutingFragments(functionName, subcommands);
 
-            String name = entry.getKey();
-            String subFunctionName = functionName + "_" + bashify(name);
+        if ((!spec.options().isEmpty() || !spec.positionalParameters().isEmpty()) && subcommands.isEmpty()) {
+            // no subcommands, single _arguments call
+            List<String> argumentFragments = new ArrayList<>();
+            argumentFragments.addAll(optionFragments);
+            argumentFragments.addAll(parameterFragments);
+            return format("%s() {\n  _arguments -s \\\n    %s\n}\n\n",
+                functionName,
+                concat("\\\n    ", argumentFragments)
+            );
+        }
 
-            routing.append("        ").append(name).append(")\n");
-            routing.append("          ").append(subFunctionName).append("\n");
-            routing.append("          ;;\n");
+        // subcommands present, _arguments call with case statement
+        if (!spec.positionalParameters().isEmpty()) {
+            // parameters are unsupported here, because it's (probably) not possible to match
+            // subcommands and positional parameters together in zsh
+            throw new IllegalArgumentException(
+                "Parameters and Subcommands are unsupported at the same level in autocompletion script"
+            );
         }
 
         String FUNCTION_WITH_SUBCOMMANDS = "" +
-                "%s() {\n" +
-                "  local line state\n" +
-                "\n" +
-                "  _arguments -C \\\n" +
-                "    %s" +
-                "\"1: :->cmds\" \\\n" +
-                "    \"*::arg:->args\"\n" +
-                "\n" +
-                "  case \"$state\" in\n" +
-                "    cmds)\n" +
-                "      _values \"%s command\" \\\n" +
-                "%s" +
-                "      ;;\n" +
-                "    args)\n" +
-                "      case $line[1] in\n" +
-                "%s" +
-                "      esac\n" +
-                "      ;;\n" +
-                "  esac\n" +
-                "}\n" +
-                "\n";
+            "%s() {\n" + // function name
+            "  local line state\n\n" +
+            "  _arguments -C -s \\\n" +
+            "    %s \\\n" + // options
+            "    \"1: :->cmds\" \\\n" +
+            "    \"*::arg:->args\"\n\n" +
+            "  case \"$state\" in\n" +
+            "    cmds)\n" +
+            "      _values \"%s command\" \\\n" + // command name
+            "        %s\n" + // command lines
+            "      ;;\n" +
+            "    args)\n" +
+            "      case $line[1] in\n" +
+            "        %s\n" + // command case statements
+            "      esac\n" +
+            "      ;;\n" +
+            "  esac\n" +
+            "}\n\n";
 
-        return format(FUNCTION_WITH_SUBCOMMANDS, functionName, optionSpecs, commandName, subcommands, routing);
+        return format(FUNCTION_WITH_SUBCOMMANDS,
+            functionName,
+            concat(" \\\n    ", optionFragments), // 4 space indent
+            commandName,
+            concat(" \\\n        ", subcommandSelectionFragments), // 8 space indent
+            concat("\n", subcommandRoutingFragments)
+                // 8 space indent, but has multiple lines, so we need to indent those as well
+                .replaceAll("\n", "\n        ")
+        );
     }
 
-    /**
-     * Generates a zsh completion function for a leaf command (no subcommands).
-     */
-    private static String generateZshLeafFunction(String scriptName, CommandDescriptor descriptor) {
-        CommandSpec spec = descriptor.commandLine.getCommandSpec();
-        String functionName = descriptor.functionName.replace("_picocli_", "_");
+    /// Start Zsh fragment helper functions
 
-        ArgumentsBuilder argsBuilder = new ArgumentsBuilder(spec);
-        String optionSpecs = argsBuilder.build();
+    private static String buildZshDescriptionFragment(String[] descriptions) {
+        // only take the first line of the description, even if there's more
+        return descriptions.length > 0 ? format("[%s]", truncate(descriptions[0], 80))
+            .replace("'", "'\\''") : "";
+    }
 
-        if (optionSpecs.length() > 0) {
-            String FUNCTION_WITH_ARGS = "" +
-                    "%s() {\n" +
-                    "  _arguments -s \\\n" +
-                    "    %s\n" +
-                    "}\n" +
-                    "\n";
-            return format(FUNCTION_WITH_ARGS, functionName, optionSpecs);
-        } else {
-            String FUNCTION_NO_ARGS = "" +
-                    "%s() {\n" +
-                    "}\n" +
-                    "\n";
-            return format(FUNCTION_NO_ARGS, functionName);
+    private static List<String> buildZshOptionFragments(List<OptionSpec> options) {
+        // TODO support negatable options
+        List<String> result = new ArrayList<>();
+        for (OptionSpec option : options) {
+            // TODO support actions (_file, _hosts), completion candidates
+            String action = "";
+            String[] names = option.names();
+            String description = buildZshDescriptionFragment(option.description());
+
+            for (String name : names) {
+                // optspec
+                String repeated = option.isMultiValue() ? "*" : "";
+                String optspec = repeated + name + description;
+
+                // optarg
+                List<String> optargs = new ArrayList<>();
+                for (int i = 0; i < option.arity().min(); i++) {
+                    // required args
+                    optargs.add(format(":%s:%s", option.paramLabel(), action));
+                }
+                for (int i = option.arity().min(); i < option.arity().max(); i++) {
+                    // optional args after the min
+                    optargs.add(format("::%s:%s", option.paramLabel(), action));
+                }
+                String optarg = concat("", optargs);
+                result.add(format("'%s%s'", optspec, optarg));
+            }
         }
+
+        return result;
     }
+
+    private static List<String> buildZshParameterFragments(List<PositionalParamSpec> params) {
+        List<String> result = new ArrayList<>();
+        for (PositionalParamSpec param : params) {
+            // TODO add completions for parameters: _file and _host and completion candidates
+            String action = "";
+            if (param.arity().isVariable()) {
+                // no upper bound on the arity
+                result.add(format("'*:%s:%s'", param.paramLabel(), action));
+                continue;
+            }
+
+            for (int pos = param.index().min(); pos <= param.index().max(); pos++) {
+                result.add(format("'%d:%s:%s'", pos, param.paramLabel(), action));
+            }
+        }
+        return result;
+    }
+
+    private static List<String> buildZshSubcommandSelectionFragments(List<CommandSpec> cmds) {
+        List<String> result = new ArrayList<>();
+        for (CommandSpec cmd: cmds) {
+            if (cmd.usageMessage().hidden()) { continue; }
+            String description = buildZshDescriptionFragment(cmd.usageMessage().description());
+            result.add(format("\"%s%s\"", cmd.name(), description));
+        }
+        return result;
+    }
+
+    private static List<String> buildZshSubcommandRoutingFragments(String functionName, List<CommandSpec> cmds) {
+        List<String> result = new ArrayList<>();
+        for (CommandSpec cmd: cmds) {
+            if (cmd.usageMessage().hidden()) { continue; }
+            String commandName = functionName + "_" + cmd.name();
+            result.add(format("%s)\n  %s\n  ;;", cmd.name(), commandName));
+        }
+        return result;
+    }
+
+    /// End Zsh fragment helper functions
 
     private static List<CommandDescriptor> createHierarchy(String scriptName, CommandLine commandLine) {
         List<CommandDescriptor> result = new ArrayList<CommandDescriptor>();
@@ -1066,6 +946,9 @@ public class AutoComplete {
         if (lastValue == null) { return sb.toString(); }
         if (sb.length() > 0) { sb.append(infix); }
         return sb.append(normalize.apply(lastValue)).toString();
+    }
+    private static String truncate(String text, int limit) {
+        return text.length() > limit ? text.substring(0, limit - 3) + "..." : text;
     }
 
     private static String generateBashFunctionForCommand(String functionName, String commandName, CommandLine commandLine) {
